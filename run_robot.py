@@ -39,10 +39,10 @@ def main():
     ap.add_argument("--duration", type=float, default=30.0)
     ap.add_argument("--rate", type=float, default=100.0, help="Hz del lazo de la laptop")
     ap.add_argument("--kd", type=float, default=0.05, help="ganancia de realim. local en la Pi [N m s/rad]")
-    ap.add_argument("--traj", choices=["circle", "spline"], default="circle")
-    ap.add_argument("--ell", type=float, default=0.10)
-    ap.add_argument("--gamma", type=float, default=15.0)
-    ap.add_argument("--kp", type=float, default=2.0)
+    ap.add_argument("--traj", choices=["circle", "spline"], default="spline")
+    ap.add_argument("--ell", type=float, default=0.08, help="distancia D al punto de control [m]")
+    ap.add_argument("--gamma", type=float, default=3.0, help="ganancia eta de la ZNN")
+    ap.add_argument("--kp", type=float, default=8.0, help="ganancia K_znn")
     ap.add_argument("--params", help="JSON con Params (modelo dinámico)")
     ap.add_argument("--log", default="run_log.csv")
     ap.add_argument("--plot", help="guardar figura PNG al terminar")
@@ -50,8 +50,7 @@ def main():
 
     p = ddmr.Params.from_json(a.params) if a.params else ddmr.Params()
     znn = ddmr.ZNNTracker(ell=a.ell, gamma=a.gamma, kp=a.kp)
-    traj = (ddmr.Circle(ell=a.ell) if a.traj == "circle" else
-            ddmr.SplineTraj([[a.ell, 0], [0.5, 0.2], [0.9, 0.0], [1.3, 0.3]], a.duration))
+    traj = ddmr.Circle(ell=a.ell) if a.traj == "circle" else ddmr.SplineTraj(ell=a.ell)
 
     # verificación cruzada de las dos formas del modelo
     e, de = np.array([3.0, 2.2]), np.array([0.5, -0.4])
