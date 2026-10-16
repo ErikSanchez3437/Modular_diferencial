@@ -1,8 +1,4 @@
-"""ddmr.py -- Lado laptop: protocolo con el puente, modelo dinámico y ZNN.
-
-Convención de arreglos: índice 0 = rueda DERECHA, índice 1 = rueda IZQUIERDA
-(eta = [phi_R_dot, phi_L_dot], tau = [tau_R, tau_L], como en el informe).
-"""
+"""ddmr.py -- Lado laptop: protocolo con el puente, modelo dinámico de Lagrange y tu ZNN."""
 from __future__ import annotations
 
 import binascii
@@ -73,12 +69,7 @@ class TelParser:
 
 
 class BridgeLink:
-    """Lanza el puente (por SSH o local) y habla con él por stdin/stdout.
-
-    cmd: lista o string. Ejemplo SSH:
-        ssh -T -o BatchMode=yes pi@IP /home/pi/TurtleTorqueNew/bridge/build/bridge
-    Si la sesión SSH se cae, el puente ve EOF en stdin y frena solo.
-    """
+    """Lanza el puente (por SSH o local) y habla con él por stdin/stdout."""
 
     def __init__(self, cmd):
         if isinstance(cmd, str):
@@ -132,13 +123,13 @@ class BridgeLink:
 
     def close(self):
         try:
-            for k in range(3):  # enable=0 explícito
+            for k in range(3):
                 self.send_ref(0xFFFF0000 + k, False, (0, 0), (0, 0), (0, 0), 0.0)
         except Exception:
             pass
         self._alive = False
         try:
-            self.proc.stdin.close()  # EOF -> el puente frena y termina
+            self.proc.stdin.close()
             self.proc.wait(timeout=3)
         except Exception:
             self.proc.kill()
@@ -147,17 +138,17 @@ class BridgeLink:
 # ===================================================================== modelo
 @dataclass
 class Params:
-    """Parámetros del modelo reparametrizado (VALORES DE PARTIDA: identificar)."""
-    R: float = 0.033      # radio de rueda [m]
-    L: float = 0.1435     # semi-separación entre ruedas [m]
-    m_eff: float = 2.5    # m + 2 I_w / R^2   [kg]
-    J_eff: float = 0.05   # I + 2 L^2 I_w / R^2 [kg m^2]
-    mu: float = 0.0       # m_c * d  [kg m]
-    d_r: float = 0.02     # fricción viscosa [N m / (rad/s)]
-    d_l: float = 0.02
-    c_r: float = 0.03     # fricción de Coulomb [N m]
-    c_l: float = 0.03
-    eps: float = 0.1      # ancho de tanh [rad/s]
+    """Parámetros del modelo dinámico calculados a partir de znnCD_control.py."""
+    R: float = 0.033          # radio de rueda [m]
+    L: float = 0.144          # mitad de distancia entre ruedas [m]
+    m_eff: float = 7.4758     # m + 2*Iw/R^2 [kg] (mc=1.37291, mw=0.02849, Iw=0.003292)
+    J_eff: float = 0.21398    # I + 2*L^2*Iw/R^2 [kg m^2] (Ic=0.07525, d=-0.064)
+    mu: float = -0.08787      # mc * d [kg m]
+    d_r: float = 0.01         # fricción viscosa [N m / (rad/s)] (ajustable)
+    d_l: float = 0.01
+    c_r: float = 0.01         # fricción de Coulomb [N m] (ajustable)
+    c_l: float = 0.01
+    eps: float = 0.1          # ancho de tanh [rad/s]
 
     @staticmethod
     def from_json(path):
@@ -187,16 +178,18 @@ def friction(p: Params, eta):
 
 
 def tau_ff(p: Params, eta_c, deta_c):
-    """Torque de feedforward: M(eta_c') + V(eta_c) eta_c + F(eta_c), forma (v, w)."""
+    """Torque de feedforward (idéntico a T1 y T2 de znnCD_control.py + fricción)."""
     v, w = wheel_to_body(p, eta_c)
     dv, dw = wheel_to_body(p, deta_c)
-    t_sum = p.R * (p.m_eff * dv - p.mu * w * w)               # tau_R + tau_L
-    t_dif = (p.R / p.L) * (p.J_eff * dw + p.mu * w * v)       # tau_R - tau_L
-    return np.array([(t_sum + t_dif) / 2, (t_sum - t_dif) / 2]) + friction(p, eta_c)
+    T1 = p.m_eff * dv - p.mu * (w ** 2)
+    T2 = p.J_eff * dw + p.mu * v * w
+    tau_R = (p.R / 2.0) * (T1 + (1.0 / p.L) * T2)
+    tau_L = (p.R / 2.0) * (T1 - (1.0 / p.L) * T2)
+    return np.array([tau_R, tau_L]) + friction(p, eta_c)
 
 
 def tau_ff_lagrange(p: Params, eta_c, deta_c):
-    """Misma cosa por la forma matricial (46) del paper principal (verificación)."""
+    """Forma matricial equivalente para verificación cruzada."""
     p1 = p.R**2 * (p.m_eff / 4 + p.J_eff / (4 * p.L**2))
     p2 = p.R**2 * (p.m_eff / 4 - p.J_eff / (4 * p.L**2))
     p3 = p.R**2 * p.mu / (2 * p.L)
@@ -206,54 +199,80 @@ def tau_ff_lagrange(p: Params, eta_c, deta_c):
     return M @ np.asarray(deta_c) + V @ np.asarray(eta_c) + friction(p, eta_c)
 
 
-# ===================================================================== ZNN
+# ===================================================================== Tu ZNN
 class ZNNTracker:
-    """ZNN de referencia para el punto P desplazado una distancia ell del eje.
+    """Controlador Cinemático ZNN adaptado de tu archivo znnCD_control.py.
 
-    P = [x + ell cos(th), y + ell sin(th)],   dP/dt = A(th) u,   u = [v, w],
-    A = [[cos th, -ell sin th], [sin th, ell cos th]]  (det A = ell > 0).
-
-    Ecuación variante en el tiempo  A(t) u = b(t),  b = dp_r + kp (p_r - p).
-    Fórmula de diseño de Zhang  eps' = -gamma eps,  eps = A u - b:
-        A u' = b' - A' u - gamma (A u - b)
-    El estado u da las velocidades y u' las aceleraciones (v', w') que necesita
-    el modelo dinámico. SUSTITUIR por la ZNN del informe si difiere: basta con
-    conservar la interfaz  step(pose, ref, dt) -> (u, du).
+    Conserva exactamente tu ley:
+        X_h = [x + D cos(th), y + D sin(th)]^T
+        U   = X_d_dot + K_znn (X_d - X_h)
+        e   = T q - U
+        q_dot = T_inv (X_d_ddot - T_dot q - eta_znn * e)
+    y la interfaz step(pose, ref, dt) -> (u, du).
     """
 
-    def __init__(self, ell=0.10, gamma=15.0, kp=2.0, v_max=0.22, w_max=1.8):
-        self.ell, self.gamma, self.kp = ell, gamma, kp
-        self.v_max, self.w_max = v_max, w_max
-        self.u = np.zeros(2)
+    def __init__(self, ell=0.08, gamma=3.0, kp=8.0, v_max=0.26, w_max=1.82):
+        self.D = ell                  # Distancia D al punto desacoplado [m]
+        self.eta_znn = gamma          # Ganancia de convergencia eta de la ZNN (3.0)
+        self.K_znn = np.eye(2) * kp   # Matriz de ganancia K_znn (8.0 * I)
+        self.v_max = v_max
+        self.w_max = w_max
+        self.q = np.zeros((2, 1))     # Estado interno q = [[v], [omega]]
 
     def step(self, pose, ref, dt):
         x, y, th = pose
-        pr, dpr, ddpr = (np.asarray(a, float) for a in ref)
-        c, s, l = math.cos(th), math.sin(th), self.ell
-        A = np.array([[c, -l * s], [s, l * c]])
-        p = np.array([x + l * c, y + l * s])
-        v, w = self.u
-        dp = A @ self.u
-        b = dpr + self.kp * (pr - p)
-        db = ddpr + self.kp * (dpr - dp)
-        Adot = w * np.array([[-s, -l * c], [c, -l * s]])
-        du = np.linalg.solve(A, db - Adot @ self.u - self.gamma * (A @ self.u - b))
-        u_new = self.u + du * dt
-        # saturación de velocidades (anti-windup: se anula la aceleración que empuja contra el límite)
-        for i, lim in enumerate((self.v_max, self.w_max)):
-            if abs(u_new[i]) > lim:
-                u_new[i] = math.copysign(lim, u_new[i])
-                if u_new[i] * du[i] > 0:
-                    du[i] = 0.0
-        self.u = u_new
-        return self.u.copy(), du
+        pr, dpr, ddpr = ref
+
+        X_d = np.asarray(pr, dtype=float).reshape(2, 1)
+        X_d_dot = np.asarray(dpr, dtype=float).reshape(2, 1)
+        X_d_ddot = np.asarray(ddpr, dtype=float).reshape(2, 1)
+
+        c, s, D = math.cos(th), math.sin(th), self.D
+
+        # Matrices T, T_inv y T_dot de tu formulación
+        T = np.array([
+            [c, -D * s],
+            [s,  D * c]
+        ])
+        T_inv = np.array([
+            [c, s],
+            [-(1.0 / D) * s, (1.0 / D) * c]
+        ])
+        omega = float(self.q[1, 0])
+        T_dot = np.array([
+            [-s * omega, -D * c * omega],
+            [ c * omega, -D * s * omega]
+        ])
+
+        # Posición actual del punto de control X_h
+        X_h = np.array([
+            [x + D * c],
+            [y + D * s]
+        ])
+
+        # Ecuación de la ZNN
+        X_h_dot = T @ self.q
+        U = X_d_dot + self.K_znn @ (X_d - X_h)
+        e = X_h_dot - U
+        gamma_e = e  # Función de activación lineal
+
+        q_dot = T_inv @ (X_d_ddot - (T_dot @ self.q) - self.eta_znn * gamma_e)
+
+        # Integración de Euler y saturación física
+        self.q = self.q + q_dot * dt
+        self.q[0, 0] = np.clip(self.q[0, 0], -self.v_max, self.v_max)
+        self.q[1, 0] = np.clip(self.q[1, 0], -self.w_max, self.w_max)
+
+        u = np.array([float(self.q[0, 0]), float(self.q[1, 0])])
+        du = np.array([float(q_dot[0, 0]), float(q_dot[1, 0])])
+        return u, du
 
 
 # ===================================================================== trayectorias
 class Circle:
-    """Círculo para el punto P, arrancando en el origen con rumbo +x."""
+    """Círculo para el punto P, arrancando en (ell, 0) con rumbo +x."""
 
-    def __init__(self, ell=0.10, r=0.40, speed=0.10):
+    def __init__(self, ell=0.08, r=0.40, speed=0.10):
         self.ell, self.r, self.Om = ell, r, speed / r
 
     def __call__(self, t):
@@ -265,17 +284,44 @@ class Circle:
 
 
 class SplineTraj:
-    """Spline cúbico por waypoints (x, y) del punto P, con tiempos uniformes."""
+    """Spline cúbico de tu znnCD_control.py con escalado automático de tiempo seguro K."""
 
-    def __init__(self, waypoints, T):
+    def __init__(self, ell=0.08, v_max=0.26, w_max=1.82):
         from scipy.interpolate import CubicSpline
 
-        wp = np.asarray(waypoints, float)
-        ts = np.linspace(0.0, T, len(wp))
-        self.T = T
-        # velocidad inicial/final nula: arranque y parada suaves
-        self.cs = CubicSpline(ts, wp, bc_type="clamped")
+        t_wp = np.array([0, 1, 2, 3, 4], dtype=float) * 5.0
+        x_wp = np.array([ell, 1.0, -1.0, -1.0, 1.0], dtype=float)
+        y_wp = np.array([0.0, 1.0,  1.0, -1.0, -1.0], dtype=float)
+
+        cs_x_orig = CubicSpline(t_wp, x_wp, bc_type="natural")
+        cs_y_orig = CubicSpline(t_wp, y_wp, bc_type="natural")
+        t_smooth = np.linspace(t_wp[0], t_wp[-1], 200)
+
+        dx, dy = cs_x_orig(t_smooth, 1), cs_y_orig(t_smooth, 1)
+        ddx, ddy = cs_x_orig(t_smooth, 2), cs_y_orig(t_smooth, 2)
+
+        v = np.sqrt(dx**2 + dy**2)
+        denom = dx**2 + dy**2
+        denom[denom == 0] = 1e-6
+        omega = (dx * ddy - dy * ddx) / denom
+
+        factor_v = np.max(np.abs(v)) / v_max
+        factor_omega = np.max(np.abs(omega)) / w_max
+        K = max(1.0, factor_v, factor_omega) * 2.0
+
+        t_seguro = t_wp * K
+        self.cs_x = CubicSpline(t_seguro, x_wp, bc_type="natural")
+        self.cs_y = CubicSpline(t_seguro, y_wp, bc_type="natural")
+        self.tf_seguro = float(t_seguro[-1])
+        print(f"[SplineTraj] Factor K: {K:.2f} | Tiempo seguro de trayectoria: {self.tf_seguro:.2f} s")
 
     def __call__(self, t):
-        t = min(max(t, 0.0), self.T)
-        return self.cs(t), self.cs(t, 1), self.cs(t, 2)
+        if t <= self.tf_seguro:
+            p = [float(self.cs_x(t)), float(self.cs_y(t))]
+            dp = [float(self.cs_x(t, 1)), float(self.cs_y(t, 1))]
+            ddp = [float(self.cs_x(t, 2)), float(self.cs_y(t, 2))]
+        else:
+            p = [float(self.cs_x(self.tf_seguro)), float(self.cs_y(self.tf_seguro))]
+            dp = [0.0, 0.0]
+            ddp = [0.0, 0.0]
+        return p, dp, ddp
